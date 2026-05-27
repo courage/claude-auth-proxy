@@ -11,9 +11,44 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// syncBuffer is a bytes.Buffer safe for the concurrent writes the proxy's
+// request logging performs from its handler goroutine while a test reads it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitForLog waits for the proxy's per-request log line, which is written after
+// ServeHTTP returns and therefore races the client. Polls briefly, then fails.
+func waitForLog(t *testing.T, b *syncBuffer) string {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := b.String(); s != "" {
+			return s
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expected a log line for the request")
+	return ""
+}
 
 const (
 	dummyToken = "sk-ant-oat01-DUMMY-from-vm"
@@ -47,7 +82,7 @@ func newFakeUpstream(t *testing.T, got *captured, respStatus int, respBody strin
 
 // newProxyServer wires NewProxyHandler in front of upstreamURL, logging to
 // logBuf, and returns an httptest server fronting it.
-func newProxyServer(t *testing.T, upstreamURL string, logBuf *bytes.Buffer) *httptest.Server {
+func newProxyServer(t *testing.T, upstreamURL string, logBuf *syncBuffer) *httptest.Server {
 	t.Helper()
 	u, err := url.Parse(upstreamURL)
 	if err != nil {
@@ -63,7 +98,7 @@ func TestProxyRewritesAuthAndForwardsEverythingElse(t *testing.T) {
 	var got captured
 	upstream := newFakeUpstream(t, &got, http.StatusOK, `{"ok":true}`)
 
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	proxy := newProxyServer(t, upstream.URL, &logBuf)
 
 	reqBody := `{"model":"claude","messages":[{"role":"user","content":"hi"}]}`
@@ -131,7 +166,7 @@ func TestProxyAlwaysHitsFixedUpstream(t *testing.T) {
 	var got captured
 	upstream := newFakeUpstream(t, &got, http.StatusOK, "ok")
 
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	proxy := newProxyServer(t, upstream.URL, &logBuf)
 
 	req, _ := http.NewRequest(http.MethodGet, proxy.URL+"/v1/models", nil)
@@ -157,7 +192,7 @@ func TestProxyPropagatesNon2xx(t *testing.T) {
 	var got captured
 	upstream := newFakeUpstream(t, &got, http.StatusTooManyRequests, `{"error":"slow down"}`)
 
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	proxy := newProxyServer(t, upstream.URL, &logBuf)
 
 	req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages", strings.NewReader("{}"))
@@ -195,7 +230,7 @@ func TestProxyStreamsSSEIncrementally(t *testing.T) {
 	}))
 	defer upstream.Close()
 
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	proxy := newProxyServer(t, upstream.URL, &logBuf)
 
 	req, _ := http.NewRequest(http.MethodGet, proxy.URL+"/v1/messages", nil)
@@ -245,7 +280,7 @@ func TestProxyNeverLogsSecrets(t *testing.T) {
 	var got captured
 	upstream := newFakeUpstream(t, &got, http.StatusOK, "ok")
 
-	var logBuf bytes.Buffer
+	var logBuf syncBuffer
 	proxy := newProxyServer(t, upstream.URL, &logBuf)
 
 	req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/v1/messages?beta=true", strings.NewReader("secret-body-contents"))
@@ -256,10 +291,7 @@ func TestProxyNeverLogsSecrets(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	logs := logBuf.String()
-	if logs == "" {
-		t.Fatal("expected a log line for the request")
-	}
+	logs := waitForLog(t, &logBuf)
 	for _, secret := range []string{realToken, dummyToken, "Bearer", "secret-body-contents"} {
 		if strings.Contains(logs, secret) {
 			t.Errorf("log output leaked %q:\n%s", secret, logs)
