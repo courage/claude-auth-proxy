@@ -1,0 +1,20 @@
+# Compiled binary (matches the module name when `go build` is run in-tree)
+/claude-auth-proxy
+
+# Nix build artifacts
+result
+result-*
+
+# Direnv
+.direnv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
