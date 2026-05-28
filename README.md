@@ -68,6 +68,28 @@ The token and `TS_AUTHKEY` are **never** logged.
 
 ## Running
 
+### Client setup (both modes)
+
+On each client (VM), Claude Code needs two things to use the proxy:
+
+1. `ANTHROPIC_BASE_URL` pointing at the proxy and a **dummy**
+   `CLAUDE_CODE_OAUTH_TOKEN` (the proxy supplies the real one). Both are shown
+   in the mode-specific examples below.
+2. A `~/.claude.json` that records onboarding as **already complete**. Even with
+   a valid `CLAUDE_CODE_OAUTH_TOKEN` set, Claude Code will still drop into the
+   interactive login flow if it thinks you haven't onboarded. The minimum is:
+
+   ```json
+   { "hasCompletedOnboarding": true }
+   ```
+
+   > **Heads up — default model.** A real onboarding run also writes
+   > subscription details into `.claude.json`, and that can pin a default model
+   > that isn't what you expect (e.g. `sonnet` instead of `opus[1m]`). If a
+   > session comes up on the wrong model, set it explicitly (`--model`, the
+   > `ANTHROPIC_MODEL` env var, or `/model`) rather than relying on the
+   > onboarding-derived default.
+
 ### tsnet mode (default — production)
 
 Joins the tailnet as `claude-auth-proxy` and listens on `:8080` over the tailnet:
@@ -138,3 +160,18 @@ Tailscale ACL/tag policy live outside this repo.
 See [TESTING.md](./TESTING.md) for the full, runnable test plan (static checks,
 unit tests with no tailnet, a manual integration run against real Anthropic, a
 tsnet/tailnet check, and negative/hardening checks).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](./LICENSE-APACHE) or
+  <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](./LICENSE-MIT) or
+  <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in the work by you, as defined in the Apache-2.0 license, shall be
+dual licensed as above, without any additional terms or conditions.
