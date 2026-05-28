@@ -1,15 +1,17 @@
 # claude-auth-proxy
 
-A small Go reverse proxy that lets **Claude Code running inside coding microVMs**
-authenticate to a Claude Pro/Max **subscription** without the long-lived OAuth
-setup-token ever living on the VMs.
+A small Go reverse proxy that can directly join a
+[Tailscale](https://tailscale.com) network (via
+[`tsnet`](https://tailscale.com/kb/1244/tsnet)) and lets **Claude Code running
+inside isolated, low-privilege coding VMs** authenticate to a Claude Pro/Max
+**subscription** without the long-lived OAuth setup-token ever living on the VMs.
 
-The proxy holds the real token, strips the dummy `Authorization` header each VM
-sends, injects the real token, and forwards the request to
-`https://api.anthropic.com`. It joins the tailnet directly via
-[`tsnet`](https://tailscale.com/kb/1244/tsnet), so access is gated by Tailscale
-ACLs and is therefore **per-VM revocable** — revoke a VM by removing its tailnet
-tag; no token rotation needed.
+The proxy holds the real token, strips the dummy `Authorization` header each
+client sends, injects the real token, and forwards the request to
+`https://api.anthropic.com`. Because it joins the Tailscale network as its own
+node, access is gated by Tailscale ACLs and is therefore **per-client
+revocable** — revoke a client by removing its tag from the network; no token
+rotation needed.
 
 ```
 Claude Code in VM  --http (over tailnet/WireGuard)-->  claude-auth-proxy (tsnet node)
@@ -21,11 +23,11 @@ Claude Code in VM  --http (over tailnet/WireGuard)-->  claude-auth-proxy (tsnet 
 
 ## Why
 
-Subscription auth's only headless credential is a ~1-year `setup-token`
+Running Claude Code inside an isolated VM reduces the attack surface available
+to prompt injection attackers, but putting long lived secrets inside the VM
+reduces this benefit. Subscription auth's only headless credential is a ~1-year `setup-token`
 (`CLAUDE_CODE_OAUTH_TOKEN`). There is no short-lived or per-token-revocable
-variant, and switching to API-key billing is not wanted. Shipping that token
-into every agent VM would put a long-lived, account-wide credential in the
-least-trusted box with no per-VM revocation. The broker/proxy pattern fixes
+variant without switching to API-key billing. The broker/proxy pattern fixes
 that: the token lives on **one** trusted node; VMs send a throwaway dummy token;
 the proxy swaps in the real one.
 
@@ -55,7 +57,7 @@ the proxy swaps in the real one.
 | `--hostname`   | `claude-auth-proxy`         | tsnet node hostname on the tailnet.                                                          |
 | `--listen`     | `:8080`                     | Listen address used in **tsnet mode**.                                                       |
 | `--state-dir`  | (none)                      | Directory for tsnet persistent state. Set this for a stable node identity across restarts.   |
-| `--local-addr` | (unset)                     | If set, listen on this plain TCP address and **skip tsnet entirely** (for local/CI testing). |
+| `--local-addr` | (unset)                     | If set, listen on this plain TCP address and **skip tsnet entirely**. No transport security — you must secure the channel yourself (see plain TCP mode). |
 
 ## Environment
 
@@ -63,8 +65,6 @@ the proxy swaps in the real one.
 | -------------------------------- | --------------------------------------------------------------------------- |
 | `TS_AUTHKEY`                     | Tailscale auth key used to join the tailnet in tsnet mode. Should be a **tagged** auth key (intended for `tag:claude-proxy`). |
 | `CLAUDE_AUTH_PROXY_TOKEN_FILE`   | Fallback for `--token-file`.                                                |
-
-The token and `TS_AUTHKEY` are **never** logged.
 
 ## Running
 
@@ -90,9 +90,11 @@ On each client (VM), Claude Code needs two things to use the proxy:
    > `ANTHROPIC_MODEL` env var, or `/model`) rather than relying on the
    > onboarding-derived default.
 
-### tsnet mode (default — production)
+### tsnet mode (default)
 
-Joins the tailnet as `claude-auth-proxy` and listens on `:8080` over the tailnet:
+Joins the Tailscale network as `claude-auth-proxy` and listens on `:8080` over
+that network. Traffic is end-to-end WireGuard-encrypted and callers are
+identified by their tailnet identity, so no extra transport security is needed.
 
 ```sh
 export TS_AUTHKEY=tskey-auth-...        # a tagged key for tag:claude-proxy
@@ -109,13 +111,10 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-DUMMY \
 claude -p "reply with exactly the single word: pong"
 ```
 
-(Claude Code accepts a plaintext `http://host:port` base URL — no client-side TLS
-is needed because tailnet traffic is WireGuard-encrypted — and runs happily with
-a dummy `CLAUDE_CODE_OAUTH_TOKEN`.)
+### plain TCP mode (`--local-addr`)
 
-### local-addr mode (testing / CI)
-
-Plain TCP socket, no tailnet, no caller identity:
+Listens on a plain TCP socket with no Tailscale, no caller identity, and **no
+transport security of its own**:
 
 ```sh
 claude-auth-proxy \
@@ -128,6 +127,13 @@ CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-DUMMY \
 claude -p "reply with exactly the single word: pong"
 ```
 
+This mode is handy for local development and CI. Because the proxy injects a
+real, account-wide credential into every forwarded request, **you must supply
+your own security for the channel** if you use it beyond `127.0.0.1` — e.g. bind
+only to a loopback or private interface, or front it with TLS and an
+authenticating reverse proxy / network policy. Anyone who can reach the listen
+address can use your subscription token.
+
 ## Building
 
 With Nix (produces a static, CGO-free binary):
@@ -136,24 +142,16 @@ With Nix (produces a static, CGO-free binary):
 nix build            # -> ./result/bin/claude-auth-proxy
 ```
 
-The flake exposes `packages.${system}.default` (so nix-config can reference
-`inputs.claude-auth-proxy.packages.${system}.default`) and a `devShells.default`
-with Go tooling. With direnv, `cd` into the repo to load the dev shell.
+The flake exposes `packages.${system}.default` (so another flake can reference it
+as `inputs.claude-auth-proxy.packages.${system}.default`) and a
+`devShells.default` with Go tooling. With direnv, `cd` into the repo to load the
+dev shell.
 
 Plain Go:
 
 ```sh
 CGO_ENABLED=0 go build ./...
 ```
-
-## Deployment
-
-Deployed as a systemd service from nix-config, mirroring `modules/golinks.nix`:
-the unit gets `TS_AUTHKEY` via an `EnvironmentFile` (sops template) and a
-`--token-file` pointing at a sops-decrypted secret, plus a `--state-dir` under
-`/var/lib`. The nix-config module, flake-input wiring, the VM-side environment
-variables (`ANTHROPIC_BASE_URL`, dummy `CLAUDE_CODE_OAUTH_TOKEN`), and the
-Tailscale ACL/tag policy live outside this repo.
 
 ## Testing
 
